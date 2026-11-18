@@ -169,6 +169,12 @@ func (e *Executor) Execute() {
 
 			log.WithField("raw_event", sourceEvent).Debug("executor: received event from source")
 
+			// when the source supports manual acknowledgement, open the single root branch for this
+			// record before fanning it out across the root nodes.  The branch count is driven inside
+			// node.ProcessEvent from here down; the source commits only the contiguous completed
+			// prefix once every terminal branch has finished.
+			e.enterRootAck(&sourceEvent)
+
 			// In this trivial implementation, used below in runNode as well, one branch of the DAG that is slow or inadequately
 			// buffered will block the send, holding up all children of the same parent.   The buffers above the blockage will
 			// then also start to fill, so buffer sizes should be chosen to prevent this case - which is expected - from causing
@@ -180,7 +186,14 @@ func (e *Executor) Execute() {
 			// somewhere in the system and can address it.   Metrics on buffer size are critical to finding the source of the
 			// blockage.
 			//
-			for _, rootNode := range e.rootNodes {
+			for i, rootNode := range e.rootNodes {
+				// each root node is an independent branch of the source record; the first root
+				// reuses the branch opened by enterRootAck, each additional root opens its own
+				if i > 0 {
+					if a := sourceEvent.Acknowledger(); a != nil {
+						a.Branch()
+					}
+				}
 				rootNode.Ch <- sourceEvent
 				metrics.Node().BufferedEvents.WithLabelValues(rootNode.Config.ID).Set(float64(len(rootNode.Ch)))
 			}

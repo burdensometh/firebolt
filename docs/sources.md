@@ -67,6 +67,7 @@ source:
     parallelrecoveryenabled: true         # [default: false] when `maxpartitionlag` limits initial lag, start a parallel consumer to fill-in the window of data that would otherwise be lost
     parallelrecoverymaxrecords: 100000    # sets a limit on the total # of events *per partition* that will be recovered
     parallelrecoverymaxrate: 1500         # max rate in events/sec that parallel recovery will process *per instance* of your application, to avoid overwhelming downstream infrastructure
+    manualoffsetcommit: true              # [default: false] commit offsets only after all required terminal branches of a source record complete; see [manual acknowledgement](manual-acknowledgement.md)
 ```
 
 ## Developing Sources

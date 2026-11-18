@@ -185,20 +185,49 @@ func (nc *Context) handleResult(err error, event *firebolt.Event, result []fireb
 			// filtered
 			log.WithField("node_id", nc.Config.ID).Debug("nil returned, filtering event")
 			metrics.Node().Filtered.WithLabelValues(nc.Config.ID).Inc()
+			// a filtered event ends this branch; there are no children to deliver to
+			terminalIfTracked(event)
 		} else {
 			// successful
 			metrics.Node().Successes.WithLabelValues(nc.Config.ID).Inc()
-			for _, childNode := range nc.Children {
-				nc.deliverToChild(childNode, result)
+			if len(nc.Children) == 0 {
+				// a successful event at a leaf node is a terminal branch
+				terminalIfTracked(event)
+			}
+			for idx, childNode := range nc.Children {
+				nc.deliverToChild(childNode, result, idx == 0)
 			}
 		}
 	}
 }
 
+// terminalIfTracked closes the acknowledgement branch carried by the event when its source runs in
+// manual acknowledgement mode.  Events without a bound tracker (auto-commit sources, internally
+// generated events) are unaffected.
+func terminalIfTracked(event *firebolt.Event) {
+	if a := event.Acknowledger(); a != nil {
+		a.Terminal()
+	}
+}
+
+// branchIfTracked opens an acknowledgement branch for one additional event delivery beyond the
+// first; the first physical delivery at a node reuses the branch already open there.
+func branchIfTracked(event *firebolt.Event) {
+	if a := event.Acknowledger(); a != nil {
+		a.Branch()
+	}
+}
+
 // deliverToChild delivers one or more successful results to a single child node, discarding or blocking (backpressure)
-// if the child's channel is full based on the node's configuration
-func (nc *Context) deliverToChild(childNode *Context, events []firebolt.Event) {
-	for _, event := range events {
+// if the child's channel is full based on the node's configuration.  When isFirstDelivery is true the branch already
+// open at the current node is reused for the first delivered event; every additional event opens its own branch.
+func (nc *Context) deliverToChild(childNode *Context, events []firebolt.Event, isFirstDelivery bool) {
+	for i, event := range events {
+		firstEvent := isFirstDelivery && i == 0
+		// one branch per physical event delivery; the first one reuses the existing branch
+		if !firstEvent {
+			branchIfTracked(&event)
+		}
 		select {
 		case childNode.Ch <- event:
 			// message was put on channel successfully
@@ -206,6 +235,10 @@ func (nc *Context) deliverToChild(childNode *Context, events []firebolt.Event) {
 			// target channel was full
 			if childNode.Config.DiscardOnFullBuffer {
 				metrics.Node().DiscardedEvents.WithLabelValues(childNode.Config.ID).Inc()
+				// the event never enters processing, so this branch ends here as a declared
+				// terminal discard; the record does not wait forever on a discarded event.  This
+				// applies to the first (reused-branch) delivery as much as any extra branch.
+				terminalIfTracked(&event)
 			} else {
 				// may block if ch still full, creating backpressure
 				metrics.Node().BufferFullEvents.WithLabelValues(childNode.Config.ID).Inc()
@@ -279,6 +312,8 @@ func (nc *Context) handleFailure(event *firebolt.Event, err error) {
 	log.WithField("node_id", nc.Config.ID).WithField("event_data", event).WithError(err).Debug("failed processing for event")
 	metrics.Node().Failures.WithLabelValues(nc.Config.ID).Inc()
 	if nc.ErrorHandler != nil {
+		// the branch open at this failing node is transferred to the error handler; the error
+		// handler is itself a full node whose own terminal outcome closes that same branch
 		// wrap up the event and the resulting error and hand 'em off to the ErrorHandler
 		eventError := firebolt.EventError{
 			Event: event,
@@ -286,10 +321,10 @@ func (nc *Context) handleFailure(event *firebolt.Event, err error) {
 		}
 
 		// process just like a 'normal' node (an errorhandler node is validated not to have any children nor an errorhandler of its own)
-		nc.ErrorHandler.Ch <- firebolt.Event{
-			Payload: eventError,
-			Created: time.Now(),
-		}
+		nc.ErrorHandler.Ch <- event.NewErrorHandlerEvent(eventError)
 		metrics.Node().BufferedEvents.WithLabelValues(nc.ErrorHandler.Config.ID).Set(float64(len(nc.ErrorHandler.Ch)))
+	} else {
+		// no error handler configured: the failure is a declared terminal outcome for this branch
+		terminalIfTracked(event)
 	}
 }

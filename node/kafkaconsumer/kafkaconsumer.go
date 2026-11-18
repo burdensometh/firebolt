@@ -13,6 +13,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/digitalocean/firebolt"
+	"github.com/digitalocean/firebolt/ack"
 	"github.com/digitalocean/firebolt/fbcontext"
 	kafkainterface "github.com/digitalocean/firebolt/kafka"
 	"github.com/digitalocean/firebolt/metrics"
@@ -38,6 +39,8 @@ type KafkaConsumer struct {
 	metrics                 *Metrics
 	recoveryConsumerEnabled bool
 	recoveryConsumer        *RecoveryConsumer
+	manualOffsetCommit      bool
+	acker                   *ack.Acker
 }
 
 // Setup instantiates and configures the underlying Kafka consumer client
@@ -60,6 +63,12 @@ func (k *KafkaConsumer) Setup(config map[string]string, eventchan chan firebolt.
 		config["parallelrecoveryenabled"] = "false"
 	}
 	k.recoveryConsumerEnabled, _ = strconv.ParseBool(config["parallelrecoveryenabled"])
+
+	// manual offset commit disabled by default; when enabled, offsets are only committed after all
+	// terminal branches of a source record complete, giving at-least-once delivery relative to the
+	// configured processing nodes
+	k.manualOffsetCommit, _ = strconv.ParseBool(config["manualoffsetcommit"])
+	k.acker = ack.NewAcker(k.manualOffsetCommit, k.commitAckedOffset)
 
 	configMap, err := k.buildConfigMap(config)
 	if err != nil {
@@ -106,12 +115,17 @@ func (k *KafkaConsumer) buildConfigMap(config map[string]string) (*kafka.ConfigM
 		return nil, errors.New("kafkaconsumer: failed to convert config 'buffersize' to integer")
 	}
 
+	// when manual offset commit is enabled we turn librdkafka's auto-commit off and drive
+	// CommitOffsets ourselves from the ack package's contiguous completed prefix; otherwise we keep
+	// the historical periodic auto-commit behavior for backward compatibility
+	autoCommit := !k.manualOffsetCommit
+
 	// default kafka consumer config
 	configMap := &kafka.ConfigMap{
 		"bootstrap.servers":               config["brokers"],
 		"group.id":                        config["consumergroup"],
 		"session.timeout.ms":              10000,
-		"enable.auto.commit":              true,
+		"enable.auto.commit":              autoCommit,
 		"auto.commit.interval.ms":         5000,
 		"statistics.interval.ms":          60000,
 		"go.events.channel.enable":        true,
@@ -177,6 +191,14 @@ func (k *KafkaConsumer) checkConfig(config map[string]string) error {
 		}
 	}
 
+	// manual offset commit is disabled by default, so don't validate boolean if empty
+	if config["manualoffsetcommit"] != "" {
+		_, err := strconv.ParseBool(config["manualoffsetcommit"])
+		if err != nil {
+			return fmt.Errorf("kafkaconsumer: invalid value for config 'manualoffsetcommit', must be a boolean: [%v]", err)
+		}
+	}
+
 	return nil
 }
 
@@ -217,13 +239,7 @@ func (k *KafkaConsumer) processEvent(ev kafka.Event) {
 	case kafka.RevokedPartitions:
 		k.revokePartitionAssignments()
 	case *kafka.Message:
-		k.sendCh <- firebolt.Event{
-			Payload:  e.Value,
-			Created:  time.Now(),
-			Recovery: false,
-		}
-		metrics.Source().EventsEmitted.Inc()
-		k.metrics.EventsConsumed.WithLabelValues(strconv.Itoa(int(e.TopicPartition.Partition))).Inc()
+		k.processMessage(e)
 	case kafka.Error:
 		log.WithField("kafka_event", e).Error("kafkaconsumer: consumer error")
 	case *kafka.Stats:
@@ -232,8 +248,74 @@ func (k *KafkaConsumer) processEvent(ev kafka.Event) {
 	}
 }
 
+// processMessage emits a consumed kafka message onto the processing channel.  In manual offset
+// commit mode the payload is wrapped in a KafkaRecord carrying partition/offset so the executor can
+// bind acknowledgement tracking to the source position; in auto-commit mode raw bytes are emitted
+// as before.
+func (k *KafkaConsumer) processMessage(e *kafka.Message) {
+	var payload interface{}
+	if k.manualOffsetCommit {
+		payload = &KafkaRecord{
+			Value:     e.Value,
+			Partition: e.TopicPartition.Partition,
+			Offset:    int64(e.TopicPartition.Offset),
+		}
+	} else {
+		payload = e.Value
+	}
+
+	k.sendCh <- firebolt.Event{
+		Payload:  payload,
+		Created:  time.Now(),
+		Recovery: false,
+	}
+	metrics.Source().EventsEmitted.Inc()
+	k.metrics.EventsConsumed.WithLabelValues(strconv.Itoa(int(e.TopicPartition.Partition))).Inc()
+}
+
+// Acker returns the manual-acknowledgement coordinator for this source; it is always non-nil after
+// Setup, but inert unless 'manualoffsetcommit' is enabled.
+func (k *KafkaConsumer) Acker() *ack.Acker {
+	return k.acker
+}
+
+// commitAckedOffset is the callback invoked by the ack package whenever a partition's contiguous
+// completed prefix advances.  It commits the next safe offset to Kafka; the generation attached to
+// the request is checked against the current assignment so a late callback from a superseded
+// generation can never commit against a newer assignment.
+func (k *KafkaConsumer) commitAckedOffset(req ack.CommitRequest) {
+	if k.consumer == nil {
+		return
+	}
+
+	topic := k.topic
+	topicPartition := kafka.TopicPartition{
+		Topic:     &topic,
+		Partition: req.Partition,
+		Offset:    kafka.Offset(req.NextOffset),
+	}
+
+	committed, err := k.consumer.CommitOffsets([]kafka.TopicPartition{topicPartition})
+	if err != nil {
+		log.WithError(err).WithField("partition_id", req.Partition).
+			WithField("next_offset", req.NextOffset).
+			Error("kafkaconsumer: failed to commit manually acknowledged offset")
+		return
+	}
+
+	log.WithField("partition_id", req.Partition).WithField("committed", committed).
+		Debug("kafkaconsumer: committed manually acknowledged offset")
+}
+
 func (k *KafkaConsumer) revokePartitionAssignments() {
 	log.Info("kafkaconsumer: revoke all partition assignments")
+
+	// fence manual-ack state first: no late completion callback from the superseded generation may
+	// commit offsets after the partitions move to another consumer.  Unacknowledged records are not
+	// committed and will be replayed from the last committed offset.
+	if k.acker != nil {
+		k.acker.RevokeAll()
+	}
 
 	// first cancel any assignments that may be in progress and wait for the lock to be available
 	k.assignPartitionsCancel()
@@ -317,6 +399,14 @@ func (k *KafkaConsumer) assignPartitions(partitions []kafka.TopicPartition) erro
 		return err
 	}
 
+	// register a fresh manual-ack generation for each assigned partition; this also fences any
+	// tracker left over from a prior generation of the same partition
+	if k.acker != nil {
+		for _, tp := range partitionsWithOffsets {
+			k.acker.AssignPartition(tp.Partition, int64(tp.Offset))
+		}
+	}
+
 	// keep the recoveryConsumer in sync with this consumer's partition assignments
 	if k.recoveryConsumerEnabled {
 		partitionsCopy := make([]kafka.TopicPartition, len(partitionsWithOffsets))
@@ -398,6 +488,16 @@ func (k *KafkaConsumer) offsetForPartition(partition int32, offsets []kafka.Topi
 // Shutdown stops the Kafka consumer client
 func (k *KafkaConsumer) Shutdown() error {
 	log.Info("kafkaconsumer: shutdown initiated")
+
+	// in manual ack mode, fence every assignment generation: in-flight records that have not reached
+	// all of their terminal branches are deliberately left uncommitted, so on restart (or rebalance
+	// to another instance) they are replayed from the last committed Kafka offset.  This provides
+	// at-least-once delivery; it does not - and cannot - provide an atomic transaction across Kafka
+	// and downstream systems such as Elasticsearch.
+	if k.acker != nil {
+		k.acker.RevokeAll()
+	}
+
 	k.doneCh <- struct{}{}
 	k.assignPartitionsCancel()
 	log.Info("kafkaconsumer: closing consumer")

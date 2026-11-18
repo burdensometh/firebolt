@@ -84,6 +84,8 @@ Some of the concerns Firebolt addresses include:
 
 11. [Metrics](docs/metrics.md) What metrics are exposed by default, and how to add custom metrics to your nodes
 
+12. [Manual Acknowledgement](docs/manual-acknowledgement.md) At-least-once offset commits driven by terminal-branch completion (no cross-system atomic transactions)
+
 
 ## Built-In Types
 

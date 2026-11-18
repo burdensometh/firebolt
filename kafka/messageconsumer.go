@@ -12,6 +12,7 @@ type MessageConsumer interface {
 	Assign(partitions []kafka.TopicPartition) error
 	Unassign() (err error)
 	Committed(partitions []kafka.TopicPartition, timeoutMs int) (offsets []kafka.TopicPartition, err error)
+	CommitOffsets(offsets []kafka.TopicPartition) ([]kafka.TopicPartition, error)
 	QueryWatermarkOffsets(topic string, partition int32, timeoutMs int) (low, high int64, err error)
 	GetMetadata(topic *string, allTopics bool, timeoutMs int) (*kafka.Metadata, error)
 	Close() (err error)
