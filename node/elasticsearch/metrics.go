@@ -16,6 +16,9 @@ type Metrics struct {
 	IndexErrors                     prometheus.CounterVec
 	ElasticsearchConnectionFailures prometheus.Counter
 	AvailableBatchRoutines          prometheus.Gauge
+	OversizedDocuments              prometheus.Counter
+	BufferedBytes                   prometheus.Gauge
+	MemoryBudgetBytes               prometheus.Gauge
 }
 
 // generateElasticsearchProcessTimeBuckets generates a bucket slice usable for bucketing the BulkProcessTime (or future
@@ -96,6 +99,30 @@ func (m *Metrics) RegisterElasticIndexMetrics(min, max float64, count int) {
 		},
 	)
 
+	m.OversizedDocuments = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metrics.Get().AppMetricsPrefix,
+			Name:      "oversized_documents_total",
+			Help:      "Number of documents rejected without queueing because their encoded bulk representation exceeded the byte limit.",
+		},
+	)
+
+	m.BufferedBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metrics.Get().AppMetricsPrefix,
+			Name:      "buffered_bytes",
+			Help:      "Encoded bulk-request bytes currently buffered: waiting to be batched, queued, in flight, or in retry.",
+		},
+	)
+
+	m.MemoryBudgetBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metrics.Get().AppMetricsPrefix,
+			Name:      "memory_budget_bytes",
+			Help:      "The configured maximum encoded bulk-request bytes that may be buffered at once.",
+		},
+	)
+
 	prometheus.Unregister(m.BulkErrors)
 	prometheus.MustRegister(m.BulkErrors)
 
@@ -119,4 +146,13 @@ func (m *Metrics) RegisterElasticIndexMetrics(min, max float64, count int) {
 
 	prometheus.Unregister(m.AvailableBatchRoutines)
 	prometheus.MustRegister(m.AvailableBatchRoutines)
+
+	prometheus.Unregister(m.OversizedDocuments)
+	prometheus.MustRegister(m.OversizedDocuments)
+
+	prometheus.Unregister(m.BufferedBytes)
+	prometheus.MustRegister(m.BufferedBytes)
+
+	prometheus.Unregister(m.MemoryBudgetBytes)
+	prometheus.MustRegister(m.MemoryBudgetBytes)
 }

@@ -82,6 +82,26 @@ func (i *Elasticsearch) Setup(cfgMap map[string]string) error {
 		return err
 	}
 
+	// the maximum encoded size, including action metadata and newlines, of a
+	// single bulk request body sent to Elasticsearch (default 10 MiB)
+	bulkMaxRequestBytes, err := config.IntConfig("bulk-max-request-bytes", 10*1024*1024, 1, math.MaxInt32)
+	if err != nil {
+		return err
+	}
+
+	// total encoded bytes that may be buffered anywhere in this node: requests
+	// waiting to be batched, queued/in-flight bulk requests, and retries.  When
+	// this budget is exhausted Send blocks, applying backpressure upstream
+	// instead of accumulating unbounded goroutines or queues.
+	defaultBufferedMemoryBytes := 10 * bulkMaxRequestBytes
+	if defaultBufferedMemoryBytes > math.MaxInt32 || defaultBufferedMemoryBytes < bulkMaxRequestBytes {
+		defaultBufferedMemoryBytes = math.MaxInt32
+	}
+	bufferedMemoryBytes, err := config.IntConfig("buffered-memory-bytes", defaultBufferedMemoryBytes, bulkMaxRequestBytes, math.MaxInt32)
+	if err != nil {
+		return err
+	}
+
 	bulkProcessHistogramMin, err := config.Float64Config("histogram-min-bucket-sec", 0.01, 0.01, math.MaxFloat64)
 	if err != nil {
 		return err
@@ -107,13 +127,16 @@ func (i *Elasticsearch) Setup(cfgMap map[string]string) error {
 	}
 
 	i.indexClient = NewElasticIndexClient(
+		ctx,
 		i.serviceFactory,
 		metrics,
 		batchSize,
 		bulkIndexMaxRetries,
 		bulkIndexTimeoutSeconds,
 		indexWorkers,
-		time.Duration(batchMaxWaitMs)*time.Millisecond)
+		time.Duration(batchMaxWaitMs)*time.Millisecond,
+		int64(bulkMaxRequestBytes),
+		int64(bufferedMemoryBytes))
 
 	go i.indexClient.Run(ctx)
 
@@ -136,7 +159,12 @@ func (i *Elasticsearch) ProcessAsync(event *firebolt.AsyncEvent) {
 		Event:       event,
 	}
 
-	i.indexClient.Send(ir)
+	// Send only returns an error for documents rejected at admission
+	// (unmarshallable or individually over the byte limits); those are returned
+	// to the caller immediately and never block the documents after them.
+	if err := i.indexClient.Send(ir); err != nil {
+		event.ReturnError(err)
+	}
 }
 
 // Receive handles a message from another node or an external source

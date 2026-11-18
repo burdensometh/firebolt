@@ -77,6 +77,24 @@ func TestSetup(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, "config value [bulk-index-timeout-seconds] requires value between [1] and [2147483647]", err.Error())
 
+	config["bulk-index-timeout-seconds"] = "20" // clean up the prev err
+	config["bulk-max-request-bytes"] = "0"      // less than minvalue
+	err = e.Setup(config)
+	assert.Error(t, err)
+	assert.Equal(t, "config value [bulk-max-request-bytes] requires value between [1] and [2147483647]", err.Error())
+
+	config["bulk-max-request-bytes"] = "1024" // clean up the prev err
+	config["buffered-memory-bytes"] = "1023"  // must be at least bulk-max-request-bytes
+	err = e.Setup(config)
+	assert.Error(t, err)
+	assert.Equal(t, "config value [buffered-memory-bytes] requires value between [1024] and [2147483647]", err.Error())
+
+	config["buffered-memory-bytes"] = "2048" // clean up the prev err
+	config["bulk-max-request-bytes"] = "not-an-int"
+	err = e.Setup(config)
+	assert.Error(t, err)
+	assert.Equal(t, "expected integer value for config [bulk-max-request-bytes]", err.Error())
+
 	// valid config
 	config = make(map[string]string)
 	config["elastic-addr"] = "localhost"
